@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import traceback
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
@@ -82,8 +83,9 @@ async def background_monitor():
                         monitor_state["previous_closed"] = closed_present
 
         except Exception as e:
-            monitor_state["last_status"] = f"Excepción: {str(e)}"
-            logger.error(f"Error en ciclo de monitoreo: {e}")
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            monitor_state["last_status"] = f"Excepción: {error_msg}"
+            logger.error(f"Error en ciclo de monitoreo: {error_msg} \n {traceback.format_exc()}")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
