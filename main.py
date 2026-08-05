@@ -4,23 +4,23 @@ import logging
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
-# Configuración de logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("consular-monitor")
 
 app = FastAPI(title="Consular Monitor & Webhook")
 
-# Variables de entorno
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "clave_segura_por_defecto")
 
-# Configuración del objetivo
-TARGET_URL = "https://www.citaconsulares.es/es/hosteds/widgetdefault/2f9880d8d5b8feb958c81d2a08157bcf1/bkt871926"
+# Conexión directa por IP fija para evitar problemas de DNS en la nube
+FORCED_IP = "185.180.12.11"
+ORIGINAL_HOST = "www.citaconsulares.es"
+TARGET_URL = f"https://{FORCED_IP}/es/hosteds/widgetdefault/2f9880d8d5b8feb958c81d2a08157bcf1/bkt871926"
+
 CLOSURE_PHRASE = "No hay horas disponibles"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
 
-# Estado global del monitor
 monitor_state = {
     "running": True,
     "last_status": "Iniciando...",
@@ -47,16 +47,17 @@ async def send_telegram(message: str) -> bool:
         return False
 
 async def background_monitor():
-    """Bucle en segundo plano que vigila el widget constantemente desde la nube"""
-    logger.info("Monitor en segundo plano iniciado...")
+    logger.info("Monitor por IP directa en segundo plano iniciado...")
     
     headers = {
+        "Host": ORIGINAL_HOST,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     while monitor_state["running"]:
         try:
-            async with httpx.AsyncClient(verify=True, follow_redirects=True) as client:
+            # verify=False para evitar problemas de certificado al consultar por IP directa
+            async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
                 response = await client.get(TARGET_URL, headers=headers, timeout=20)
                 
                 if response.status_code != 200:
@@ -88,7 +89,6 @@ async def background_monitor():
 
 @app.on_event("startup")
 async def startup_event():
-    # Arranca el monitor automático al iniciar FastAPI
     asyncio.create_task(background_monitor())
 
 @app.get("/")
