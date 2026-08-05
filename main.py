@@ -1,19 +1,33 @@
 import os
+import asyncio
 import logging
+import httpx
 from fastapi import FastAPI, Request, HTTPException
-import requests
 
 # Configuración de logs
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("consular-webhook")
+logger = logging.getLogger("consular-monitor")
 
-app = FastAPI(title="Consular Notifier Webhook")
+app = FastAPI(title="Consular Monitor & Webhook")
 
+# Variables de entorno
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "clave_segura_por_defecto")
 
-def send_telegram(message: str) -> bool:
+# Configuración del objetivo
+TARGET_URL = "https://www.citaconsulares.es/es/hosteds/widgetdefault/2f9880d8d5b8feb958c81d2a08157bcf1/bkt871926"
+CLOSURE_PHRASE = "No hay horas disponibles"
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
+
+# Estado global del monitor
+monitor_state = {
+    "running": True,
+    "last_status": "Iniciando...",
+    "previous_closed": None
+}
+
+async def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("Faltan las credenciales de Telegram.")
         return False
@@ -25,38 +39,80 @@ def send_telegram(message: str) -> bool:
         "disable_web_page_preview": True
     }
     try:
-        r = requests.post(api_url, json=payload, timeout=10)
-        return r.status_code == 200
+        async with httpx.AsyncClient() as client:
+            r = await client.post(api_url, json=payload, timeout=10)
+            return r.status_code == 200
     except Exception as e:
         logger.error(f"Error al enviar mensaje a Telegram: {e}")
         return False
 
+async def background_monitor():
+    """Bucle en segundo plano que vigila el widget constantemente desde la nube"""
+    logger.info("Monitor en segundo plano iniciado...")
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    while monitor_state["running"]:
+        try:
+            async with httpx.AsyncClient(verify=True, follow_redirects=True) as client:
+                response = await client.get(TARGET_URL, headers=headers, timeout=20)
+                
+                if response.status_code != 200:
+                    monitor_state["last_status"] = f"Error HTTP {response.status_code}"
+                    logger.warning(f"Servidor respondió con estado: {response.status_code}")
+                else:
+                    page_text = response.text
+                    closed_present = CLOSURE_PHRASE.lower() in page_text.lower()
+                    
+                    monitor_state["last_status"] = "Cerrado / Sin citas" if closed_present else "¡Posible apertura!"
+                    
+                    if monitor_state["previous_closed"] is None:
+                        monitor_state["previous_closed"] = closed_present
+                        logger.info(f"Estado inicial registrado: {monitor_state['last_status']}")
+                    
+                    elif monitor_state["previous_closed"] and not closed_present:
+                        logger.info("¡CAMBIO DETECTADO! La frase de cierre ha desaparecido.")
+                        msg = "🚨 ¡ATENCIÓN PEDRY! Hay cambios en la agenda consular. ¡Posible apertura de citas!"
+                        await send_telegram(msg)
+                        monitor_state["previous_closed"] = closed_present
+                    else:
+                        monitor_state["previous_closed"] = closed_present
+
+        except Exception as e:
+            monitor_state["last_status"] = f"Excepción: {str(e)}"
+            logger.error(f"Error en ciclo de monitoreo: {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+@app.on_event("startup")
+async def startup_event():
+    # Arranca el monitor automático al iniciar FastAPI
+    asyncio.create_task(background_monitor())
+
 @app.get("/")
 def health_check():
-    return {"status": "online", "service": "Consular Webhook Receiver"}
+    return {
+        "status": "online",
+        "monitor": monitor_state
+    }
 
 @app.post("/webhook/{secret_key}")
 async def receive_webhook(secret_key: str, request: Request):
-    # Validar clave secreta por seguridad para que nadie más spamee tu endpoint
     if secret_key != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Acceso no autorizado")
     
     try:
         body = await request.json()
-        logger.info(f"Webhook recibido: {body}")
+        evento = body.get("evento", "Aviso externo")
+        detalles = body.get("detalles", "Notificación recibida vía webhook.")
         
-        # Extraer datos o mensaje personalizado enviado en el JSON del webhook
-        evento = body.get("evento", "Cambio detectado")
-        detalles = body.get("detalles", "Hay movimiento en la agenda consular.")
-        
-        mensaje = f"🚨 ¡AVISO DE WEBHOOK CONSULAR!\n\n📌 **{evento}**\n📝 {detalles}"
-        
-        if send_telegram(mensaje):
-            return {"status": "success", "message": "Notificación enviada a Telegram correctamente"}
+        mensaje = f"🚨 **AVISO EXTERNO**\n\n📌 {evento}\n📝 {detalles}"
+        if await send_telegram(mensaje):
+            return {"status": "success"}
         else:
-            raise HTTPException(status_code=500, detail="Error al notificar a Telegram")
-            
+            raise HTTPException(status_code=500, detail="Error enviando a Telegram")
     except Exception as e:
-        logger.error(f"Error procesando el webhook: {e}")
-        raise HTTPException(status_code=400, detail="Formato JSON inválido o error interno")
-      
+        raise HTTPException(status_code=400, detail=str(e))
+        
