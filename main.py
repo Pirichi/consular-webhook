@@ -14,10 +14,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "clave_segura_por_defecto")
 
-# Conexión directa por IP fija para evitar problemas de DNS en la nube
-FORCED_IP = "185.180.12.11"
 ORIGINAL_HOST = "www.citaconsulares.es"
-TARGET_URL = f"https://{FORCED_IP}/es/hosteds/widgetdefault/2f9880d8d5b8feb958c81d2a08157bcf1/bkt871926"
+TARGET_PATH = "/es/hosteds/widgetdefault/2f9880d8d5b8feb958c81d2a08157bcf1/bkt871926"
 
 CLOSURE_PHRASE = "No hay horas disponibles"
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "30"))
@@ -27,6 +25,23 @@ monitor_state = {
     "last_status": "Iniciando...",
     "previous_closed": None
 }
+
+async def resolve_doh(domain: str) -> str | None:
+    """Resuelve la IP usando el servicio DoH (DNS over HTTPS) de Cloudflare"""
+    doh_url = f"https://cloudflare-dns.com/dns-query?name={domain}&type=A"
+    headers = {"Accept": "application/dns-json"}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(doh_url, headers=headers, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                answers = data.get("Answer", [])
+                for ans in answers:
+                    if ans.get("type") == 1:  # Tipo A (IPv4)
+                        return ans.get("data")
+    except Exception as e:
+        logger.warning(f"Fallo en DoH resolution: {e}")
+    return None
 
 async def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -48,18 +63,26 @@ async def send_telegram(message: str) -> bool:
         return False
 
 async def background_monitor():
-    logger.info("Monitor por IP directa en segundo plano iniciado...")
+    logger.info("Monitor con resolución DoH en segundo plano iniciado...")
     
-    headers = {
-        "Host": ORIGINAL_HOST,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-
     while monitor_state["running"]:
         try:
-            # verify=False para evitar problemas de certificado al consultar por IP directa
+            # 1. Resolvemos la IP actual mediante DoH de Cloudflare
+            resolved_ip = await resolve_doh(ORIGINAL_HOST)
+            if not resolved_ip:
+                logger.warning("No se pudo resolver la IP por DoH, reintentando...")
+                monitor_state["last_status"] = "Error resolviendo DNS (DoH)"
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            target_url = f"https://{resolved_ip}{TARGET_PATH}"
+            headers = {
+                "Host": ORIGINAL_HOST,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+
             async with httpx.AsyncClient(verify=False, follow_redirects=True) as client:
-                response = await client.get(TARGET_URL, headers=headers, timeout=20)
+                response = await client.get(target_url, headers=headers, timeout=20)
                 
                 if response.status_code != 200:
                     monitor_state["last_status"] = f"Error HTTP {response.status_code}"
